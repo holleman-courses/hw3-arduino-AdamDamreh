@@ -1,102 +1,115 @@
 #include <Arduino.h>
+#include "HW3model.h"
+#include <TensorFlowLite.h>
+
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/version.h"
+
+#define SERIAL_BAUD_RATE 115200
 #define INPUT_BUFFER_SIZE 64
-#define OUTPUT_BUFFER_SIZE 64
-#define INT_ARRAY_SIZE 8
+#define INT_ARRAY_SIZE 7
 
-// put function declarations here:
-int string_to_array(char *in_str, int *int_array);
-void print_int_array(int *int_array, int array_len);
-int sum_array(int *int_array, int array_len);
+char in_str_buff[INPUT_BUFFER_SIZE + 1];
+int in_buff_idx = 0;
 
+static tflite::MicroErrorReporter micro_error_reporter;
+static const tflite::Model* model = tflite::GetModel(model_int8_tflite);
+static constexpr int kTensorArenaSize = 8 * 1024;  // Increased to 8 KB
+static uint8_t tensor_arena[kTensorArenaSize];
 
-char received_char = (char)NULL;              
-int chars_avail = 0;                    // input present on terminal
-char out_str_buff[OUTPUT_BUFFER_SIZE];  // strings to print to terminal
-char in_str_buff[INPUT_BUFFER_SIZE];    // stores input from terminal
-int input_array[INT_ARRAY_SIZE];        // array of integers input by user
+// Updated resolver with 5 ops
+static tflite::MicroMutableOpResolver<5> resolver;
+static tflite::MicroInterpreter* interpreter = nullptr;
+static TfLiteTensor* input = nullptr;
+static TfLiteTensor* output = nullptr;
 
-int in_buff_idx=0; // tracks current input location in input buffer
-int array_length=0;
-int array_sum=0;
+bool parse_input(char* buffer, int* output_array, size_t max_numbers) {
+  char* token = strtok(buffer, " ");
+  size_t count = 0;
+
+  while (token != NULL && count < max_numbers) {
+    output_array[count++] = atoi(token);
+    token = strtok(NULL, " ");
+  }
+
+  return (count == max_numbers);
+}
 
 void setup() {
-  // put your setup code here, to run once:
-  delay(5000);
-  // Arduino does not have a stdout, so printf does not work easily
-  // So to print fixed messages (without variables), use 
-  // Serial.println() (appends new-line)  or Serial.print() (no added new-line)
-  Serial.println("Test Project waking up");
-  memset(in_str_buff, (char)0, INPUT_BUFFER_SIZE*sizeof(char)); 
+  Serial.begin(SERIAL_BAUD_RATE);
+  while (!Serial);
+
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("Model version mismatch!");
+    while (1);
+  }
+
+  // Register all required ops
+  resolver.AddFullyConnected();
+  resolver.AddRelu();
+  resolver.AddSoftmax();
+  resolver.AddMul();
+  resolver.AddAdd();  // Critical for ADD operator
+
+  interpreter = new tflite::MicroInterpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, &micro_error_reporter);
+
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("Tensor allocation failed!");
+    while (1);
+  }
+
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+
+  Serial.println("System ready! Enter 7 numbers:");
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-
-  // check if characters are avialble on the terminal input
-  chars_avail = Serial.available(); 
-  if (chars_avail > 0) {
-    received_char = Serial.read(); // get the typed character and 
-    Serial.print(received_char);   // echo to the terminal
-
-    in_str_buff[in_buff_idx++] = received_char; // add it to the buffer
-    if (received_char == 13) { // 13 decimal = newline character
-      // user hit 'enter', so we'll process the line.
-      Serial.print("About to process line: ");
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+    
+    if (c == '\n' || c == '\r') {
+      in_str_buff[in_buff_idx] = '\0';
+      Serial.print("\nRaw input: ");
       Serial.println(in_str_buff);
+      int input_values[INT_ARRAY_SIZE];
+      bool valid = parse_input(in_str_buff, input_values, INT_ARRAY_SIZE);
 
-      // Process and print out the array
-      array_length = string_to_array(in_str_buff, input_array);
-      sprintf(out_str_buff, "Read in  %d integers: ", array_length);
-      Serial.print(out_str_buff);
-      print_int_array(input_array, array_length);
-      array_sum = sum_array(input_array, array_length);
-      sprintf(out_str_buff, "Sums to %d\r\n", array_sum);
-      Serial.print(out_str_buff);
+      if (!valid) {
+        Serial.println("Error: Need exactly 7 numbers");
+      } else {
+        for (int i = 0; i < INT_ARRAY_SIZE; i++) {
+          input->data.int8[i] = static_cast<int8_t>(input_values[i]);
+        }
 
-      // Now clear the input buffer and reset the index to 0
-      memset(in_str_buff, (char)0, INPUT_BUFFER_SIZE*sizeof(char)); 
+        unsigned long t_infer_start = micros();
+        TfLiteStatus status = interpreter->Invoke();
+        unsigned long t_infer_end = micros();
+
+        if (status != kTfLiteOk) {
+          Serial.println("Inference failed!");
+        } else {
+          unsigned long t_print_start = micros();
+          Serial.print("Prediction: ");
+          Serial.println(output->data.int8[0]);
+          unsigned long t_print_end = micros();
+
+          Serial.print("Print time (μs): ");
+          Serial.println(t_print_end - t_print_start);
+          Serial.print("Inference time (μs): ");
+          Serial.println(t_infer_end - t_infer_start);
+        }
+      }
+
       in_buff_idx = 0;
-    }
-    else if (in_buff_idx >= INPUT_BUFFER_SIZE) {
-      memset(in_str_buff, (char)0, INPUT_BUFFER_SIZE*sizeof(char)); 
-      in_buff_idx = 0;
-    }    
-  }
-}
-
-int string_to_array(char *in_str, int *int_array) {
-  int num_integers=0;
-  char *token = strtok(in_str, ",");
-  
-  while (token != NULL) {
-    int_array[num_integers++] = atoi(token);
-    token = strtok(NULL, ",");
-    if (num_integers >= INT_ARRAY_SIZE) {
-      break;
+      memset(in_str_buff, 0, sizeof(in_str_buff));
+      
+    } else if (in_buff_idx < INPUT_BUFFER_SIZE) {
+      in_str_buff[in_buff_idx++] = c;
     }
   }
-  
-  return num_integers;
-}
-
-void print_int_array(int *int_array, int array_len) {
-  int curr_pos = 0; // track where in the output buffer we're writing
-
-  sprintf(out_str_buff, "Integers: [");
-  curr_pos = strlen(out_str_buff); // so the next write adds to the end
-  for(int i=0;i<array_len;i++) {
-    // sprintf returns number of char's written. use it to update current position
-    curr_pos += sprintf(out_str_buff+curr_pos, "%d, ", int_array[i]);
-  }
-  sprintf(out_str_buff+curr_pos, "]\r\n");
-  Serial.print(out_str_buff);
-}
-
-int sum_array(int *int_array, int array_len) {
-  int curr_sum = 0; // running sum of the array
-
-  for(int i=0;i<array_len;i++) {
-    curr_sum += int_array[i];
-  }
-  return curr_sum;
 }
